@@ -307,6 +307,9 @@
 }
 
 .assetActionBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   border: 1px solid rgba(13, 148, 136, 0.25);
   background: linear-gradient(180deg, #ffffff, #f0fdfa);
   color: #0f766e;
@@ -325,6 +328,31 @@
   background: linear-gradient(135deg, #ccfbf1, #99f6e4);
   color: #115e59;
   cursor: default;
+}
+
+.assetCheck {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1.5px solid rgba(15, 118, 110, 0.5);
+  background: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+  color: transparent;
+}
+
+.assetCheckOn {
+  background: #0f766e;
+  border-color: #0f766e;
+  color: #ffffff;
+}
+
+.assetActionText {
+  line-height: 1;
 }
 
 .replyActions {

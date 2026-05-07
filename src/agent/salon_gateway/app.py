@@ -53,6 +53,16 @@ _booking_sessions = BookingSessionStore()
 _conversation_images = ConversationImageStore()
 _SIMULATE_UPLOADS_DIR = Path(__file__).resolve().parents[1] / "outputs" / "simulate_uploads"
 _SIMULATE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+_CONSULT_SUMMARY_REFRESH_DELAY_SECONDS = 30.0
+_consult_summary_tasks: dict[str, asyncio.Task[None]] = {}
+_BOOKING_FLUSH_QUEUE_MAXSIZE = 2000
+_booking_flush_queue: asyncio.Queue[BookingDraft] = asyncio.Queue(maxsize=_BOOKING_FLUSH_QUEUE_MAXSIZE)
+_booking_flush_worker_task: asyncio.Task[None] | None = None
+_booking_flush_enqueued_total = 0
+_booking_flush_dropped_total = 0
+_booking_flush_processed_total = 0
+_booking_flush_failed_total = 0
+_booking_flush_warn_latched = False
 
 _CN_PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 _URL_RE = re.compile(r"https?://[^\s)\]>]+", re.IGNORECASE)
@@ -91,6 +101,148 @@ def _get_sink(settings: SalonGatewaySettings) -> FeishuBitableSink | LoggingSink
         else:
             _sink = LoggingSink()
     return _sink
+
+
+def _enqueue_booking_flush(draft: BookingDraft) -> None:
+    """Non-blocking enqueue; drop oldest when queue is full to protect chat latency."""
+    global _booking_flush_enqueued_total, _booking_flush_dropped_total
+    try:
+        _booking_flush_queue.put_nowait(draft)
+        _booking_flush_enqueued_total += 1
+    except asyncio.QueueFull:
+        dropped: BookingDraft | None = None
+        try:
+            dropped = _booking_flush_queue.get_nowait()
+            _booking_flush_queue.task_done()
+            _booking_flush_dropped_total += 1
+        except Exception:
+            pass
+        try:
+            _booking_flush_queue.put_nowait(draft)
+            _booking_flush_enqueued_total += 1
+            logger.warning(
+                "booking flush queue full, dropped oldest draft cid={} then enqueued new one",
+                (dropped.conversation_id if dropped else ""),
+            )
+        except Exception:
+            logger.error(
+                "booking flush queue full, failed to enqueue draft cid={}",
+                (draft.conversation_id or ""),
+            )
+    _maybe_warn_booking_flush_backlog()
+
+
+def _booking_flush_queue_stats() -> dict[str, int]:
+    return {
+        "size": _booking_flush_queue.qsize(),
+        "maxsize": _BOOKING_FLUSH_QUEUE_MAXSIZE,
+        "enqueued_total": _booking_flush_enqueued_total,
+        "dropped_total": _booking_flush_dropped_total,
+        "processed_total": _booking_flush_processed_total,
+        "failed_total": _booking_flush_failed_total,
+    }
+
+
+def _maybe_warn_booking_flush_backlog() -> None:
+    global _booking_flush_warn_latched
+    maxsize = int(_booking_flush_queue.maxsize or 0)
+    size = int(_booking_flush_queue.qsize())
+    if maxsize <= 0:
+        return
+    ratio = size / maxsize
+    settings = get_settings()
+    threshold = float(settings.booking_flush_queue_warn_ratio)
+    if ratio >= threshold:
+        if not _booking_flush_warn_latched:
+            logger.warning(
+                "booking flush queue backlog high: size={} maxsize={} ratio={:.3f} threshold={:.3f}",
+                size,
+                maxsize,
+                ratio,
+                threshold,
+            )
+            _booking_flush_warn_latched = True
+    elif ratio < max(0.0, threshold - 0.1):
+        _booking_flush_warn_latched = False
+
+
+def _prometheus_perf_metrics(stats: dict[str, object]) -> str:
+    q = stats.get("booking_flush_queue") if isinstance(stats, dict) else {}
+    qd = q if isinstance(q, dict) else {}
+    ttfb = stats.get("ttfb_ms") if isinstance(stats, dict) else {}
+    elapsed = stats.get("elapsed_ms") if isinstance(stats, dict) else {}
+    ttfb_d = ttfb if isinstance(ttfb, dict) else {}
+    elapsed_d = elapsed if isinstance(elapsed, dict) else {}
+    lines = [
+        "# HELP salon_chat_fast_ratio Rolling fast-model hit ratio.",
+        "# TYPE salon_chat_fast_ratio gauge",
+        f"salon_chat_fast_ratio {float(stats.get('fast_ratio', 0.0) or 0.0):.6f}",
+        "# HELP salon_chat_ttfb_ms Time-to-first-byte latency in milliseconds.",
+        "# TYPE salon_chat_ttfb_ms gauge",
+        f"salon_chat_ttfb_ms{{quantile=\"p50\"}} {float(ttfb_d.get('p50', 0.0) or 0.0):.3f}",
+        f"salon_chat_ttfb_ms{{quantile=\"p95\"}} {float(ttfb_d.get('p95', 0.0) or 0.0):.3f}",
+        f"salon_chat_ttfb_ms{{quantile=\"max\"}} {float(ttfb_d.get('max', 0.0) or 0.0):.3f}",
+        "# HELP salon_chat_elapsed_ms End-to-end latency in milliseconds.",
+        "# TYPE salon_chat_elapsed_ms gauge",
+        f"salon_chat_elapsed_ms{{quantile=\"p50\"}} {float(elapsed_d.get('p50', 0.0) or 0.0):.3f}",
+        f"salon_chat_elapsed_ms{{quantile=\"p95\"}} {float(elapsed_d.get('p95', 0.0) or 0.0):.3f}",
+        f"salon_chat_elapsed_ms{{quantile=\"max\"}} {float(elapsed_d.get('max', 0.0) or 0.0):.3f}",
+        "# HELP salon_booking_flush_queue_size Pending booking flush jobs.",
+        "# TYPE salon_booking_flush_queue_size gauge",
+        f"salon_booking_flush_queue_size {int(qd.get('size', 0) or 0)}",
+        "# HELP salon_booking_flush_queue_maxsize Booking flush queue capacity.",
+        "# TYPE salon_booking_flush_queue_maxsize gauge",
+        f"salon_booking_flush_queue_maxsize {int(qd.get('maxsize', 0) or 0)}",
+        "# HELP salon_booking_flush_total Booking flush counters.",
+        "# TYPE salon_booking_flush_total counter",
+        f"salon_booking_flush_total{{status=\"enqueued\"}} {int(qd.get('enqueued_total', 0) or 0)}",
+        f"salon_booking_flush_total{{status=\"processed\"}} {int(qd.get('processed_total', 0) or 0)}",
+        f"salon_booking_flush_total{{status=\"failed\"}} {int(qd.get('failed_total', 0) or 0)}",
+        f"salon_booking_flush_total{{status=\"dropped\"}} {int(qd.get('dropped_total', 0) or 0)}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+async def _booking_flush_worker() -> None:
+    global _booking_flush_processed_total, _booking_flush_failed_total
+    settings = get_settings()
+    while True:
+        draft = await _booking_flush_queue.get()
+        try:
+            sink = _get_sink(settings)
+            ok = False
+            max_attempts = int(settings.booking_flush_retry_max_attempts)
+            base_ms = int(settings.booking_flush_retry_base_delay_ms)
+            for attempt in range(max_attempts):
+                try:
+                    await sink.append_booking(draft)
+                    _booking_flush_processed_total += 1
+                    ok = True
+                    break
+                except Exception as e:
+                    is_last = attempt >= max_attempts - 1
+                    if is_last:
+                        raise
+                    backoff_s = (base_ms * (2**attempt)) / 1000.0
+                    logger.warning(
+                        "async booking flush retry cid={} attempt={}/{} backoff_s={:.3f} err={}",
+                        (draft.conversation_id or ""),
+                        attempt + 1,
+                        max_attempts,
+                        backoff_s,
+                        e,
+                    )
+                    await asyncio.sleep(backoff_s)
+            if not ok:
+                _booking_flush_failed_total += 1
+        except asyncio.CancelledError:
+            _booking_flush_queue.task_done()
+            raise
+        except Exception as e:
+            _booking_flush_failed_total += 1
+            logger.warning("async booking flush failed cid={}: {}", (draft.conversation_id or ""), e)
+        finally:
+            _booking_flush_queue.task_done()
 
 
 def _detect_ticket_type(text: str, has_assets: bool) -> str:
@@ -151,12 +303,13 @@ async def _auto_save_consult_ticket(
     selected_asset_ids: list[str] | None = None,
     action: str | None = None,
     session_phone: str | None = None,
+    content_summary: str | None = None,
 ) -> None:
-    sink = _get_sink(settings)
     text = (content or "").strip()
     assets = [x.strip() for x in (selected_asset_ids or []) if str(x).strip()]
     handoff_requested, handoff_reason = _extract_handoff(action)
     phone = _extract_phone(f"{text} {session_phone or ''}".strip())
+    summary_final = (content_summary or "").strip() or None
     draft = BookingDraft(
         conversation_id=(from_user or "").strip(),
         channel=channel,
@@ -164,7 +317,7 @@ async def _auto_save_consult_ticket(
         wechat_id=(from_user or "").strip() or None,
         phone=phone,
         ticket_type=_detect_ticket_type(text, bool(assets)),
-        content_summary=(text[:500] if text else None),
+        content_summary=summary_final,
         appointment_time=_extract_appointment_time(text),
         appointment_intent=("有意向" if _extract_appointment_time(text) else "待确认"),
         product_ids=assets or None,
@@ -176,10 +329,83 @@ async def _auto_save_consult_ticket(
         handoff_reason=handoff_reason,
         status="pending",
     )
+    _enqueue_booking_flush(draft)
+
+
+async def _upsert_consult_content_summary(
+    settings: SalonGatewaySettings,
+    *,
+    from_user: str,
+    channel: str,
+    content_summary: str,
+    session_phone: str | None = None,
+) -> None:
+    summary = (content_summary or "").strip()
+    if not summary:
+        return
+    user = (from_user or "").strip()
+    phone = _extract_phone(session_phone or "")
+    draft = BookingDraft(
+        conversation_id=user,
+        channel=channel,
+        external_user_id=user or None,
+        wechat_id=user or None,
+        phone=phone,
+        content_summary=summary,
+        status="pending",
+    )
+    _enqueue_booking_flush(draft)
+
+
+async def _refresh_consult_summary_later(
+    settings: SalonGatewaySettings,
+    *,
+    from_user: str,
+    channel: str,
+) -> None:
     try:
-        await sink.append_booking(draft)
+        await asyncio.sleep(_CONSULT_SUMMARY_REFRESH_DELAY_SECONDS)
+        pipe = _get_pipeline(settings)
+        summary = pipe.consult_content_summary(from_user, "")
+        await _upsert_consult_content_summary(
+            settings,
+            from_user=from_user,
+            channel=channel,
+            content_summary=summary,
+            session_phone=pipe.profile_phone(from_user),
+        )
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        logger.warning("auto-save consult ticket failed: {}", e)
+        logger.warning("background consult summary refresh failed: {}", e)
+
+
+def _schedule_consult_summary_refresh(
+    settings: SalonGatewaySettings,
+    *,
+    from_user: str,
+    channel: str,
+) -> None:
+    user = (from_user or "").strip()
+    if not user:
+        return
+    old = _consult_summary_tasks.get(user)
+    if old and not old.done():
+        old.cancel()
+    task = asyncio.create_task(
+        _refresh_consult_summary_later(
+            settings,
+            from_user=user,
+            channel=channel,
+        )
+    )
+    _consult_summary_tasks[user] = task
+
+    def _drop_done(done: asyncio.Task[None]) -> None:
+        if _consult_summary_tasks.get(user) is done:
+            _consult_summary_tasks.pop(user, None)
+
+    task.add_done_callback(_drop_done)
 
 
 def _normalize_secret(s: str) -> str:
@@ -280,10 +506,27 @@ def _auth_simulate(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    del app
+    global _booking_flush_worker_task
     settings = get_settings()
     logger.remove()
     logger.add(sys.stderr, level=(settings.log_level or "INFO").upper())
-    yield
+    global _booking_flush_queue, _booking_flush_warn_latched
+    queue_max = int(settings.booking_flush_queue_maxsize)
+    if queue_max > 0 and queue_max != _booking_flush_queue.maxsize and _booking_flush_queue.qsize() == 0:
+        _booking_flush_queue = asyncio.Queue(maxsize=queue_max)
+        _booking_flush_warn_latched = False
+        logger.info("booking flush queue resized to {}", queue_max)
+    _booking_flush_worker_task = asyncio.create_task(_booking_flush_worker())
+    try:
+        yield
+    finally:
+        if _booking_flush_worker_task and not _booking_flush_worker_task.done():
+            _booking_flush_worker_task.cancel()
+            try:
+                await _booking_flush_worker_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Furnishing gateway (WeCom -> LangGraph -> Feishu)", lifespan=_lifespan)
@@ -394,15 +637,18 @@ async def wecom_message(
 
     pipe = _get_pipeline(settings)
     text = await pipe.handle_message(msg)
+    raw_content = msg.content if hasattr(msg, "content") else "[图片咨询]"
     await _auto_save_consult_ticket(
         settings,
         from_user=msg.from_user,
-        content=(msg.content if hasattr(msg, "content") else "[图片咨询]"),
+        content=raw_content,
         reply=text,
         channel="wecom",
         image_url=(msg.pic_url if hasattr(msg, "pic_url") else None),
         selected_asset_ids=None,
+        session_phone=pipe.profile_phone(msg.from_user),
     )
+    _schedule_consult_summary_refresh(settings, from_user=msg.from_user, channel="wecom")
     reply = render_text_reply(to_user=msg.from_user, from_user=msg.to_user, content=text)
     out = wecom.encrypt_reply(reply)
     return PlainTextResponse(content=out, media_type="application/xml; charset=utf-8")
@@ -697,6 +943,53 @@ async def internal_booking_options(
         raise HTTPException(status_code=502, detail="feishu fields failed") from e
 
 
+@app.get("/internal/perf-stats")
+async def internal_perf_stats(
+    authorization: Annotated[str | None, Header()] = None,
+    x_salon_token: Annotated[str | None, Header(alias="X-Salon-Token")] = None,
+) -> dict[str, object]:
+    """聚合对话性能：TTFB / 总耗时 / 快模型命中率（基于进程内最近样本）。"""
+    settings = get_settings()
+    _auth_internal(settings, authorization, x_salon_token)
+    pipe = _get_pipeline(settings)
+    return {
+        **pipe.perf_stats(),
+        "booking_flush_queue": _booking_flush_queue_stats(),
+    }
+
+
+@app.post("/internal/perf-stats/reset")
+async def internal_perf_stats_reset(
+    authorization: Annotated[str | None, Header()] = None,
+    x_salon_token: Annotated[str | None, Header(alias="X-Salon-Token")] = None,
+) -> dict[str, object]:
+    """重置进程内性能样本，便于对比调优前后数据窗口。"""
+    settings = get_settings()
+    _auth_internal(settings, authorization, x_salon_token)
+    pipe = _get_pipeline(settings)
+    out = pipe.reset_perf_stats()
+    return {**out, "booking_flush_queue": _booking_flush_queue_stats()}
+
+
+@app.get("/internal/perf-stats/prometheus")
+async def internal_perf_stats_prometheus(
+    authorization: Annotated[str | None, Header()] = None,
+    x_salon_token: Annotated[str | None, Header(alias="X-Salon-Token")] = None,
+) -> Response:
+    """Prometheus 文本指标（鉴权同 /internal/booking）。"""
+    settings = get_settings()
+    _auth_internal(settings, authorization, x_salon_token)
+    pipe = _get_pipeline(settings)
+    stats: dict[str, object] = {
+        **pipe.perf_stats(),
+        "booking_flush_queue": _booking_flush_queue_stats(),
+    }
+    return Response(
+        content=_prometheus_perf_metrics(stats),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
 @app.post("/internal/feishu/ensure-fields")
 async def internal_feishu_ensure_fields(
     authorization: Annotated[str | None, Header()] = None,
@@ -727,17 +1020,19 @@ async def simulate_wecom_text(
     pipe = _get_pipeline(settings)
     if _is_handoff_action(body.action):
         reply = pipe.handoff_simulate_ack(body.from_user.strip(), body.action)
+        fu = body.from_user.strip()
         await _auto_save_consult_ticket(
             settings,
-            from_user=body.from_user.strip(),
+            from_user=fu,
             content=body.content,
             reply=reply,
             channel="simulate",
             image_url=body.image_url,
             selected_asset_ids=body.selected_asset_ids,
             action=body.action,
-            session_phone=pipe.profile_phone(body.from_user.strip()),
+            session_phone=pipe.profile_phone(fu),
         )
+        _schedule_consult_summary_refresh(settings, from_user=fu, channel="simulate")
         return {"reply": reply, **pipe.ui_snapshot(body.from_user.strip())}
     reply = await pipe.handle_with_image(
         body.from_user.strip(),
@@ -747,16 +1042,19 @@ async def simulate_wecom_text(
         selected_asset_ids=body.selected_asset_ids,
         action=body.action,
     )
+    fu = body.from_user.strip()
     await _auto_save_consult_ticket(
         settings,
-        from_user=body.from_user.strip(),
+        from_user=fu,
         content=body.content,
         reply=reply,
         channel="simulate",
         image_url=body.image_url,
         selected_asset_ids=body.selected_asset_ids,
         action=body.action,
+        session_phone=pipe.profile_phone(fu),
     )
+    _schedule_consult_summary_refresh(settings, from_user=fu, channel="simulate")
     return {"reply": reply, **pipe.ui_snapshot(body.from_user.strip())}
 
 
@@ -775,17 +1073,19 @@ async def simulate_wecom_text_stream(
         chunks: list[str] = []
         if _is_handoff_action(body.action):
             reply = pipe.handoff_simulate_ack(body.from_user.strip(), body.action)
+            fu = body.from_user.strip()
             await _auto_save_consult_ticket(
                 settings,
-                from_user=body.from_user.strip(),
+                from_user=fu,
                 content=body.content,
                 reply=reply,
                 channel="simulate-stream",
                 image_url=body.image_url,
                 selected_asset_ids=body.selected_asset_ids,
                 action=body.action,
-                session_phone=pipe.profile_phone(body.from_user.strip()),
+                session_phone=pipe.profile_phone(fu),
             )
+            _schedule_consult_summary_refresh(settings, from_user=fu, channel="simulate-stream")
             msg = json.dumps({"event": "message", "answer": reply}, ensure_ascii=False)
             yield f"data: {msg}\n\n".encode("utf-8")
             snap = pipe.ui_snapshot(body.from_user.strip())
@@ -819,16 +1119,19 @@ async def simulate_wecom_text_stream(
                     pass
                 yield chunk
             if chunks:
+                fu = body.from_user.strip()
                 await _auto_save_consult_ticket(
                     settings,
-                    from_user=body.from_user.strip(),
+                    from_user=fu,
                     content=body.content,
                     reply="".join(chunks),
                     channel="simulate-stream",
                     image_url=body.image_url,
                     selected_asset_ids=body.selected_asset_ids,
                     action=body.action,
+                    session_phone=pipe.profile_phone(fu),
                 )
+                _schedule_consult_summary_refresh(settings, from_user=fu, channel="simulate-stream")
         except httpx.HTTPStatusError as e:
             logger.warning("simulate stream upstream HTTP {}", e.response.status_code)
             err = json.dumps(

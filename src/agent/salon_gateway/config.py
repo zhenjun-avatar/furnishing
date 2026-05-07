@@ -58,6 +58,24 @@ class SalonGatewaySettings(BaseSettings):
         default="",
         description="非空则覆盖 DEFAULT_MODEL；空则读环境变量 DEFAULT_MODEL",
     )
+    llm_vision_model: str = Field(
+        default="qwen/qwen-vl-plus",
+        description="带图轮次强制使用的多模态模型",
+    )
+    llm_fast_model: str = Field(
+        default="",
+        description="快模型（可选）。短消息优先使用；为空则始终使用 llm_model/DEFAULT_MODEL",
+    )
+    llm_fast_query_chars: int = Field(
+        default=80,
+        ge=20,
+        le=500,
+        description="短消息路由阈值（字符数）；<= 阈值且无图片时可走快模型",
+    )
+    intent_router_enabled: bool = Field(
+        default=True,
+        description="是否启用规则意图路由（图像相关/文本事务/混合）",
+    )
     llm_temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="聊天温度")
     memory_recent_messages: int = Field(
         default=16,
@@ -65,17 +83,53 @@ class SalonGatewaySettings(BaseSettings):
         le=60,
         description="每轮发送给模型的最近消息条数（不含系统提示/摘要）",
     )
+    memory_recent_messages_short: int = Field(
+        default=8,
+        ge=4,
+        le=30,
+        description="短消息时使用的最近消息条数（进一步降低首 token 延迟）",
+    )
     memory_summary_max_chars: int = Field(
         default=1200,
         ge=200,
         le=8000,
         description="滚动摘要最大字符数（超出会截断）",
     )
+    memory_keep_image_turns: int = Field(
+        default=1,
+        ge=0,
+        le=8,
+        description="历史中最多保留多少个含图用户轮次（其余仅保留文本）",
+    )
 
     # --- 内部：Dify HTTP 工具回调写预约 ---
     internal_booking_token: str = Field(
         default="",
         description="Bearer / X-Salon-Token；多个等价值用 | 分隔（Dify 与 .env 长度不一致时可各填一份）",
+    )
+    booking_flush_queue_maxsize: int = Field(
+        default=2000,
+        ge=200,
+        le=20000,
+        description="异步写飞书队列容量；满时会丢弃最旧消息保护主链路",
+    )
+    booking_flush_queue_warn_ratio: float = Field(
+        default=0.7,
+        ge=0.1,
+        le=0.98,
+        description="队列占用告警阈值（size/maxsize）",
+    )
+    booking_flush_retry_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description="异步写飞书失败重试次数（含首次）",
+    )
+    booking_flush_retry_base_delay_ms: int = Field(
+        default=150,
+        ge=20,
+        le=5000,
+        description="异步写飞书重试基础退避毫秒（指数退避）",
     )
 
     # --- 模拟企微文本（仅调试；生产勿设置）---

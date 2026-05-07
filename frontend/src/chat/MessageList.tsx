@@ -124,7 +124,10 @@ function Bubble({
                         onClick={() => onToggleAssetId(id)}
                         aria-label={selected ? `取消选择 ${id}` : `选择 ${id}`}
                       >
-                        {selected ? "取消" : "选择"}
+                        <span className={`${styles.assetCheck} ${selected ? styles.assetCheckOn : ""}`} aria-hidden>
+                          {selected ? "✓" : ""}
+                        </span>
+                        <span className={styles.assetActionText}></span>
                       </button>
                     </div>
                   );

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,6 +43,77 @@ def _furnishing_registry_cached(path_key: str) -> FurnishingRegistry:
 _PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
 _ASSET_ID_RE = re.compile(r"\bdemo-[a-z0-9-]+\b", re.IGNORECASE)
 
+_REQ_SNIPPET_MAX = 6
+_REQ_SNIPPET_CHAR_MAX = 160
+_CONSULT_SUMMARY_CHAR_MAX = 1200
+_ASSET_CACHE_TTL_SECONDS = 300.0
+_ASSET_HINT_CACHE_TTL_SECONDS = 180.0
+
+_MAJOR_CITIES = (
+    "北京",
+    "上海",
+    "广州",
+    "深圳",
+    "杭州",
+    "成都",
+    "武汉",
+    "西安",
+    "南京",
+    "苏州",
+    "重庆",
+    "天津",
+    "郑州",
+    "长沙",
+    "东莞",
+    "佛山",
+    "宁波",
+    "无锡",
+    "青岛",
+    "合肥",
+    "厦门",
+    "福州",
+    "济南",
+    "昆明",
+    "沈阳",
+    "石家庄",
+    "太原",
+    "南宁",
+    "贵阳",
+    "海口",
+    "兰州",
+    "乌鲁木齐",
+)
+
+_STYLE_TERMS_ORDERED = (
+    "现代简约",
+    "新中式",
+    "奶油风",
+    "工业风",
+    "法式",
+    "原木风",
+    "北欧",
+    "日式",
+    "美式",
+    "轻奢",
+    "中式",
+    "简约",
+    "原木",
+    "现代",
+)
+
+_BUDGET_RANGE_RE = re.compile(r"(?:预算|报价|价位|费用)[：:\s]*([^\n。]{1,56}?)(?:[。\n]|$)")
+_BUDGET_WAN_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-~～至到]\s*(\d+(?:\.\d+)?)\s*万")
+_BUDGET_SIMPLE_WAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*万")
+
+_BOILERPLATE_USER_PREFIXES = (
+    "我选择了这些素材",
+    "生成效果图",
+    "需要转人工",
+    "暂不转人工",
+    "查看可选素材",
+)
+_IMAGE_QUERY_STUB = "[图片] 请根据这张照片"
+
 
 @dataclass(slots=True)
 class _ServiceProfile:
@@ -56,6 +128,10 @@ class _ServiceProfile:
     contact_prompted: bool = False
     ui_state: str = "INIT"
     ui_actions: list[str] = field(default_factory=list)
+    requirement_snippets: list[str] = field(default_factory=list)
+    slot_city: str = ""
+    slot_budget: str = ""
+    slot_style: str = ""
 
 
 class SalonPipeline:
@@ -69,6 +145,10 @@ class SalonPipeline:
         self._chat = chat
         self._store = store
         self._profiles: dict[str, _ServiceProfile] = {}
+        self._assets_cache_at: float = 0.0
+        self._assets_cache_items: list[Any] = []
+        self._asset_hint_cache_at: float = 0.0
+        self._asset_hint_cache_text: str = ""
 
     def _session_user(self, wecom_user: str) -> str:
         p = self._s.dify_user_prefix.strip() or "wecom"
@@ -116,12 +196,78 @@ class SalonPipeline:
         ids = self._valid_asset_ids([*(selected_asset_ids or []), *self._extract_asset_ids_from_text(t)])
         if ids:
             p.selected_asset_ids = self._merge_asset_ids(p.selected_asset_ids, ids)
+        self._merge_slots_from_text(p, t)
+        self._record_requirement_snippet(p, t)
         return p
 
+    @staticmethod
+    def _normalize_requirement_snippet(text: str) -> str | None:
+        t = (text or "").strip().replace("\r\n", "\n").replace("\r", "\n")
+        if len(t) < 3:
+            return None
+        for bp in _BOILERPLATE_USER_PREFIXES:
+            if t.startswith(bp):
+                return None
+        if t.startswith(_IMAGE_QUERY_STUB):
+            return "上传实景图，咨询软装与空间搭配"
+        if len(t) > _REQ_SNIPPET_CHAR_MAX:
+            return t[: _REQ_SNIPPET_CHAR_MAX - 1].rstrip() + "…"
+        return t
+
+    def _merge_slots_from_text(self, profile: _ServiceProfile, text: str) -> None:
+        raw = (text or "").strip()
+        if not raw:
+            return
+        if not profile.slot_city:
+            for c in _MAJOR_CITIES:
+                if c in raw:
+                    profile.slot_city = c
+                    break
+        bud = ""
+        mr = _BUDGET_WAN_RANGE_RE.search(raw)
+        if mr:
+            bud = f"{mr.group(1)}-{mr.group(2)}万"
+        else:
+            ms = _BUDGET_SIMPLE_WAN_RE.search(raw)
+            if ms:
+                bud = f"{ms.group(1)}万"
+            else:
+                mm = _BUDGET_RANGE_RE.search(raw)
+                if mm:
+                    bud = mm.group(1).strip()[:56]
+        if bud:
+            profile.slot_budget = bud
+        found_styles = [s for s in _STYLE_TERMS_ORDERED if s in raw]
+        if found_styles:
+            existing = [x.strip() for x in profile.slot_style.split("、") if x.strip()] if profile.slot_style else []
+            order: list[str] = []
+            for x in [*existing, *found_styles]:
+                if x not in order:
+                    order.append(x)
+            profile.slot_style = "、".join(order[:6])
+
+    def _record_requirement_snippet(self, profile: _ServiceProfile, text: str) -> None:
+        snip = self._normalize_requirement_snippet(text)
+        if not snip:
+            return
+        if profile.requirement_snippets and profile.requirement_snippets[-1] == snip:
+            return
+        profile.requirement_snippets.append(snip)
+        if len(profile.requirement_snippets) > _REQ_SNIPPET_MAX:
+            profile.requirement_snippets = profile.requirement_snippets[-_REQ_SNIPPET_MAX :]
+
     def _all_assets_by_id(self) -> dict[str, Any]:
+        return {x.id: x for x in self._cached_assets()}
+
+    def _cached_assets(self) -> list[Any]:
+        now = time.monotonic()
+        if self._assets_cache_items and (now - self._assets_cache_at) < _ASSET_CACHE_TTL_SECONDS:
+            return self._assets_cache_items
         reg = _furnishing_registry_cached(self._s.furnishing_assets_path.as_posix())
         items, _ = reg.search(q="", category="", limit=100)
-        return {x.id: x for x in items}
+        self._assets_cache_items = list(items)
+        self._assets_cache_at = now
+        return self._assets_cache_items
 
     def _valid_asset_ids(self, ids: list[str] | None) -> list[str]:
         raw = [str(x).strip() for x in (ids or []) if str(x).strip()]
@@ -220,6 +366,97 @@ class SalonPipeline:
     def profile_phone(self, wecom_user: str) -> str:
         return (self._profile(self._session_user(wecom_user)).phone or "").strip()
 
+    def perf_stats(self) -> dict[str, Any]:
+        fn = getattr(self._chat, "perf_stats", None)
+        if callable(fn):
+            try:
+                data = fn()
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                logger.warning("pipeline perf_stats read failed: {}", e)
+        return {
+            "total_turns": 0,
+            "fast_turns": 0,
+            "fast_ratio": 0.0,
+            "sample_size": 0,
+            "sample_window_max": 0,
+            "mode_counts": {"stream": 0, "complete": 0},
+            "compact_ratio": 0.0,
+            "with_files_ratio": 0.0,
+            "ttfb_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+            "elapsed_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+            "recent_samples": [],
+        }
+
+    def reset_perf_stats(self) -> dict[str, Any]:
+        fn = getattr(self._chat, "reset_perf_stats", None)
+        if callable(fn):
+            try:
+                data = fn()
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                logger.warning("pipeline reset_perf_stats failed: {}", e)
+        return {"ok": False, "cleared_samples": 0}
+
+    def _format_selected_assets_for_summary(self, ids: list[str]) -> str:
+        if not ids:
+            return "暂无"
+        try:
+            by_id = self._all_assets_by_id()
+            parts: list[str] = []
+            for aid in ids[:8]:
+                it = by_id.get(aid)
+                label = aid
+                if it is not None:
+                    name = getattr(it, "name", "") or ""
+                    if name:
+                        label = f"{aid}（{name}）"
+                parts.append(label)
+            return "、".join(parts)
+        except Exception as e:
+            logger.debug("asset labels for summary skipped: {}", e)
+            return "、".join(ids[:8])
+
+    def consult_content_summary(self, wecom_user: str, latest_user_text: str = "") -> str:
+        """飞书「需求摘要」：会话画像 + 槽位 + 多轮诉求要点，避免仅截取末句。"""
+        user = self._session_user(wecom_user)
+        p = self._profile(user)
+        snippets = list(p.requirement_snippets)
+        extra = self._normalize_requirement_snippet(latest_user_text or "")
+        if extra and (not snippets or snippets[-1] != extra):
+            snippets.append(extra)
+
+        lines: list[str] = []
+        lines.append("【咨询会话摘要】")
+        ph = (p.phone or "").strip()
+        lines.append(f"• 联系方式：{'已记录手机号 ' + ph if ph else '待用户补充手机号'}")
+        has_img = bool(p.latest_image_url or p.latest_upload_file_id or p.has_room_image)
+        lines.append(f"• 实景图：{'已提供' if has_img else '未提供'}")
+        lines.append(f"• 意向素材：{self._format_selected_assets_for_summary(p.selected_asset_ids)}")
+        if p.handoff_known:
+            ho = "需要人工跟进" if p.handoff_requested else "暂不转人工"
+        else:
+            ho = "用户尚未选择转人工与否"
+        lines.append(f"• 转人工：{ho}")
+        if (p.slot_city or "").strip():
+            lines.append(f"• 城市/区域：{p.slot_city.strip()}")
+        if (p.slot_budget or "").strip():
+            lines.append(f"• 预算：{p.slot_budget.strip()}")
+        if (p.slot_style or "").strip():
+            lines.append(f"• 风格偏好：{p.slot_style.strip()}")
+        show_snips = snippets[-6:] if len(snippets) > 6 else snippets
+        if show_snips:
+            lines.append("")
+            lines.append("【用户诉求要点】")
+            for i, s in enumerate(show_snips, 1):
+                lines.append(f"{i}. {s}")
+        out = "\n".join(lines).strip()
+        if len(out) > _CONSULT_SUMMARY_CHAR_MAX:
+            out = out[: _CONSULT_SUMMARY_CHAR_MAX - 1].rstrip() + "…"
+        return out
+
     def handoff_simulate_ack(self, wecom_user: str, action: str | None) -> str:
         """仅 simulate 转人工控件：更新会话画像并返回给前端的固定提示（不走 LLM）。"""
         user = self._session_user(wecom_user)
@@ -260,6 +497,11 @@ class SalonPipeline:
         preview_ready: bool = False,
     ) -> None:
         act = (action or "").strip()
+        # 已确认转人工且已留手机号：进入等待人工态，不再引导用户继续点选功能按钮。
+        if profile.handoff_known and profile.handoff_requested and (profile.phone or "").strip():
+            profile.ui_state = "WAITING_HUMAN"
+            profile.ui_actions = []
+            return
         actions: list[str] = []
         if preview_ready:
             state = "PREVIEW_READY"
@@ -314,16 +556,20 @@ class SalonPipeline:
         return f"{q}\n\n{hint}" if q else hint
 
     def _build_asset_suggestion_hint(self) -> str:
+        now = time.monotonic()
+        if self._asset_hint_cache_text and (now - self._asset_hint_cache_at) < _ASSET_HINT_CACHE_TTL_SECONDS:
+            return self._asset_hint_cache_text
         try:
-            reg = _furnishing_registry_cached(self._s.furnishing_assets_path.as_posix())
-            items, _ = reg.search(q="", category="", limit=20)
+            items = self._cached_assets()[:20]
         except Exception as e:
             logger.debug("build asset suggestion hint skipped: {}", e)
             return ""
         if not items:
+            self._asset_hint_cache_text = ""
+            self._asset_hint_cache_at = now
             return ""
         lines = [f"- {it.id}：{(it.name or it.id)}" for it in items]
-        return (
+        text = (
             "【真实素材库】可用素材如下，请仅从这些素材中推荐或生成：\n"
             + "\n".join(lines)
             + "\n【严格约束】\n"
@@ -331,6 +577,9 @@ class SalonPipeline:
             "- 若用户要求生成效果图，但未选择素材ID，必须先让用户从上方素材ID中选择，不能承诺已经开始生成。\n"
             "- 用户也可以选择列表之外的素材，但必须提供明确素材ID或图片。"
         )
+        self._asset_hint_cache_text = text
+        self._asset_hint_cache_at = now
+        return text
 
     def _catalog_items_for_query(self, query: str) -> list:
         reg = _furnishing_registry_cached(self._s.furnishing_assets_path.as_posix())
@@ -371,6 +620,23 @@ class SalonPipeline:
     @staticmethod
     def _room_image_fast_reply() -> str:
         return "已收到实景图，且你已选好素材，可直接点击下方“生成效果图”。"
+
+    def _handoff_phone_fast_reply(self, profile: _ServiceProfile, query: str, action: str | None) -> str | None:
+        """已登记转人工后，手机号消息直接收口，避免重复调用 LLM。"""
+        if (action or "").strip() in {"handoff_yes", "handoff_no"}:
+            return None
+        if not (profile.handoff_known and profile.handoff_requested):
+            return None
+        text = (query or "").strip()
+        if not text:
+            return None
+        m = _PHONE_RE.search(text)
+        if not m:
+            return None
+        return (
+            f"已收到你的手机号 **{m.group(1)}**，并已完成转人工登记。"
+            "客服会尽快联系你并跟进本次空间搭配需求。"
+        )
 
     def _missing_asset_for_generation_reply(self) -> str:
         asset_hint = self._build_asset_suggestion_hint()
@@ -484,6 +750,15 @@ class SalonPipeline:
         query_eff = self._inject_customer_service_goal(query, profile)
         has_room_image = bool(effective_image_url or effective_upload_file_id)
         has_assets = bool(effective_asset_ids)
+        handoff_phone_reply = self._handoff_phone_fast_reply(profile, query, action)
+        if handoff_phone_reply:
+            self._set_ui(
+                profile,
+                has_room_image=has_room_image,
+                has_assets=has_assets,
+                action=action,
+            )
+            return handoff_phone_reply
         if current_asset_ids and self._is_asset_selection_action(act):
             self._set_ui(
                 profile,
@@ -547,11 +822,14 @@ class SalonPipeline:
                 query=query_eff,
                 conversation_id=cid,
                 files=files,
-                inputs=self._memory_inputs(
-                    profile,
-                    has_room_image=has_room_image,
-                    selected_asset_ids=effective_asset_ids,
-                ),
+                inputs={
+                    **self._memory_inputs(
+                        profile,
+                        has_room_image=has_room_image,
+                        selected_asset_ids=effective_asset_ids,
+                    ),
+                    "__raw_query": query,
+                },
             )
         except httpx.HTTPStatusError as e:
             try:
@@ -661,6 +939,20 @@ class SalonPipeline:
         fresh_generate_opportunity = current_has_room_image or bool(current_asset_ids)
         has_room_image = bool(effective_image_url or effective_upload_file_id)
         has_assets = bool(effective_asset_ids)
+        handoff_phone_reply = self._handoff_phone_fast_reply(profile, query, action)
+        if handoff_phone_reply:
+            self._set_ui(
+                profile,
+                has_room_image=has_room_image,
+                has_assets=has_assets,
+                action=action,
+            )
+            payload = json.dumps({"event": "message", "answer": handoff_phone_reply}, ensure_ascii=False)
+            ui_payload = json.dumps({"event": "ui_actions", **self.ui_snapshot(wecom_user)}, ensure_ascii=False)
+            yield f"data: {payload}\n\n".encode("utf-8")
+            yield f"data: {ui_payload}\n\n".encode("utf-8")
+            yield b"data: {\"event\":\"message_end\"}\n\n"
+            return
         if current_asset_ids and self._is_asset_selection_action(act):
             self._set_ui(
                 profile,
@@ -761,11 +1053,14 @@ class SalonPipeline:
                 query=query_eff,
                 conversation_id=cid,
                 files=files,
-                inputs=self._memory_inputs(
-                    profile,
-                    has_room_image=has_room_image,
-                    selected_asset_ids=effective_asset_ids,
-                ),
+                inputs={
+                    **self._memory_inputs(
+                        profile,
+                        has_room_image=has_room_image,
+                        selected_asset_ids=effective_asset_ids,
+                    ),
+                    "__raw_query": query,
+                },
                 conversation_id_holder=holder,
             ):
                 yield chunk
