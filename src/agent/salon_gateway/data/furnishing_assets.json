@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "assets": [
+    {
+      "id": "demo-sofa-01",
+      "category": "sofa",
+      "name": "三人绒面沙发",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/sofa-living.jpg",
+      "tags": ["沙发", "客厅", "绒面", "墨绿", "现代"],
+      "price": "¥4,980",
+      "dimensions": "240×95×82cm"
+    },
+    {
+      "id": "demo-sofa-living-001",
+      "category": "sofa",
+      "name": "浅灰布艺双人沙发（木方腿）",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/sofa-living-001.webp",
+      "tags": ["沙发", "客厅", "双人位", "布艺", "浅灰", "现代简约", "木腿"],
+      "price": "¥3,280",
+      "dimensions": "185×88×78cm"
+    },
+    {
+      "id": "demo-sofa-living-002",
+      "category": "sofa",
+      "name": "驼色仿皮拉扣双人沙发",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/sofa-living-002.webp",
+      "tags": ["沙发", "客厅", "双人位", "仿皮", "驼色", "拉扣", "现代"],
+      "price": "¥3,680",
+      "dimensions": "190×92×80cm"
+    },
+    {
+      "id": "demo-sofa-living-003",
+      "category": "sofa",
+      "name": "橄榄绿灯芯绒无扶手沙发单元",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/sofa-living-003.webp",
+      "tags": ["沙发", "客厅", "单人模块", "灯芯绒", "橄榄绿", "无扶手", "现代"],
+      "price": "¥1,280/模块",
+      "dimensions": "85×85×42cm"
+    },
+    {
+      "id": "demo-coffee-table-01",
+      "category": "coffee_table",
+      "name": "茶几与客厅陈设",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/coffee-table.jpg",
+      "tags": ["茶几", "客厅", "木色"],
+      "price": "¥1,580",
+      "dimensions": "120×60×42cm"
+    },
+    {
+      "id": "demo-chair-01",
+      "category": "chair",
+      "name": "餐椅/座椅",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/dining-chairs.jpg",
+      "tags": ["餐椅", "桌椅", "餐厅"],
+      "price": "¥298/把",
+      "dimensions": "45×52×88cm"
+    },
+    {
+      "id": "demo-bedding-01",
+      "category": "bedding",
+      "name": "卧室床品",
+      "image_url": "https://quizmesh.tech/salon/furnishing-asset-files/bedroom-bedding.jpg",
+      "tags": ["床品", "卧室", "软装"],
+      "price": "¥688起",
+      "dimensions": "被套 220×240cm"
+    }
+  ]
+}
